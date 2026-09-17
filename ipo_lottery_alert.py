@@ -151,7 +151,7 @@ def main():
         if key in notified:
             continue  # 這檔已經通知過了
 
-        status = "🟢 申購中" if item["note"] == "申購中" else "🔜 即將開放申購"
+        status = f"🟢 {item["note"]}"
         offer_price_str = f"{item['offer_price']:.2f}" if item["offer_price"] is not None else "—"
         market_price_str = f"{item['market_price']:.2f}" if item["market_price"] is not None else "—"
         text = (

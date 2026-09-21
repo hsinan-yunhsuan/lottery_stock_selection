@@ -2,48 +2,81 @@
 LINE Bot：公開申購／股票抽籤提醒
 ----------------------------------
 邏輯：
-  1. 抓 HiStock 的「公開申購/股票抽籤日程表」網頁
-  2. 網頁裡的表格本身就有「報酬率(%)」欄位（承銷價 vs 市價的價差），不用自己再抓即時股價算
-  3. 篩選出「還沒截止申購」且「報酬率 >= THRESHOLD_PCT」的股票
-  4. 透過 LINE Messaging API 推播；同一檔股票（用代碼+抽籤日當 key）只會提醒一次
+1. 抓 HiStock 的「公開申購/股票抽籤日程表」網頁（連線失敗會自動重試）
+2. 網頁裡的表格本身就有「報酬率(%)」欄位（承銷價 vs 市價的價差），不用自己再抓即時股價算
+3. 篩選出「還沒截止申購」且「報酬率 >= THRESHOLD_PCT」的股票
+4. 透過 LINE Messaging API 推播；同一檔股票（用代碼+抽籤日當 key）只會提醒一次
+5. 如果整支程式執行失敗，會推播一則失敗通知（同一天最多一則），並以錯誤碼 1 結束，
+   讓 GitHub Actions 顯示紅叉
 
 需要的環境變數：
-  LINE_CHANNEL_ACCESS_TOKEN
-  LINE_USER_ID
+    LINE_CHANNEL_ACCESS_TOKEN
+    LINE_USER_ID
 
 安裝套件：
-  pip install requests pandas lxml
+    pip install requests pandas lxml
 """
 
 import os
+import sys
 import json
-import requests
-import pandas as pd
+import time
+import traceback
+from datetime import datetime, timedelta, timezone
 from io import StringIO
+
+import pandas as pd
+import requests
 
 # ------------------------
 # 設定區
 # ------------------------
 THRESHOLD_PCT = 20  # 報酬率超過這個百分比才提醒
-STATE_FILE = "ipo_alert_state.json"  # 記錄「哪些（股票代碼+抽籤日）已經提醒過」，避免重複通知
-
+STATE_FILE = "ipo_alert_state.json"  # 記錄已提醒過的股票，以及最近一次失敗通知的日期
 LINE_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_TO = os.environ["LINE_USER_ID"]
-
 SOURCE_URL = "https://histock.tw/stock/public.aspx"
+
+MAX_RETRIES = 4  # 抓網頁最多嘗試幾次
+RETRY_BASE_DELAY = 5  # 重試間隔秒數（第 n 次失敗後等待 5*n 秒）
+
+TZ_TAIPEI = timezone(timedelta(hours=8))
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Referer": "https://histock.tw/",
+}
+
+
+# ------------------------
+# 抓取與解析
+# ------------------------
+def fetch_html():
+    """抓 HiStock 申購日程表的 HTML，遇到連線問題會自動重試"""
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(SOURCE_URL, headers=REQUEST_HEADERS, timeout=(10, 20))
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            return resp.text
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            print(f"第 {attempt}/{MAX_RETRIES} 次抓取失敗：{e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BASE_DELAY * attempt)
+    raise last_err
 
 
 def fetch_offering_table():
     """抓 HiStock 申購日程表，回傳 pandas DataFrame"""
-    resp = requests.get(
-        SOURCE_URL,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-
-    tables = pd.read_html(StringIO(resp.text))
+    html = fetch_html()
+    tables = pd.read_html(StringIO(html))
     for df in tables:
         # 用欄位名稱找出「抽籤日程表」那張表，避免網頁上其他表格干擾
         if any("抽籤日期" in str(c) for c in df.columns):
@@ -86,7 +119,6 @@ def parse_candidates(df):
             return_pct = float(row.get(col_return))
         except (TypeError, ValueError):
             continue
-
         if return_pct < THRESHOLD_PCT:
             continue
 
@@ -94,7 +126,6 @@ def parse_candidates(df):
             offer_price = float(row.get(col_offer_price))
         except (TypeError, ValueError):
             offer_price = None
-
         try:
             market_price = float(row.get(col_market_price))
         except (TypeError, ValueError):
@@ -116,10 +147,19 @@ def parse_candidates(df):
     return candidates
 
 
+# ------------------------
+# 狀態檔
+# ------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if isinstance(state, dict):
+                state.setdefault("notified", [])
+                return state
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"讀取狀態檔失敗，將使用空白狀態：{e}")
     return {"notified": []}
 
 
@@ -128,6 +168,9 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False)
 
 
+# ------------------------
+# LINE 推播
+# ------------------------
 def push_line_message(text):
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
@@ -136,40 +179,84 @@ def push_line_message(text):
     }
     body = {"to": LINE_TO, "messages": [{"type": "text", "text": text}]}
     resp = requests.post(url, headers=headers, json=body, timeout=10)
+    if not resp.ok:
+        # 印出 LINE 回傳的錯誤內容，方便判斷是 token、user ID 還是額度問題
+        print(f"LINE API 回應 {resp.status_code}：{resp.text}")
     resp.raise_for_status()
 
 
+def notify_failure(err):
+    """整支程式失敗時推播提醒；同一天最多一則，避免一天跑多次時洗版"""
+    today = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d")
+    state = load_state()
+    if state.get("last_error_alert") == today:
+        print("今天已經發過失敗通知，這次不再重複發送")
+        return
+
+    err_text = f"{type(err).__name__}: {err}"
+    if len(err_text) > 300:
+        err_text = err_text[:300] + "…"
+    text = (
+        "⚠️ 申購抽籤提醒程式執行失敗\n"
+        f"錯誤：{err_text}\n"
+        "請到 GitHub Actions 查看詳細 log。"
+    )
+    try:
+        push_line_message(text)
+        state["last_error_alert"] = today
+        save_state(state)
+        print("已推播失敗通知")
+    except Exception as e:  # 通知本身失敗就只記錄，不要蓋掉原本的錯誤
+        print(f"失敗通知也推播失敗：{e}")
+
+
+# ------------------------
+# 主流程
+# ------------------------
 def main():
     state = load_state()
     notified = set(state.get("notified", []))
 
     df = fetch_offering_table()
     candidates = parse_candidates(df)
+    print(f"符合條件的股票共 {len(candidates)} 檔")
 
     for item in candidates:
         key = f"{item['code']}_{item['draw_date']}"
         if key in notified:
             continue  # 這檔已經通知過了
 
-        status = f"🟢 {item["note"]}"
-        offer_price_str = f"{item['offer_price']:.2f}" if item["offer_price"] is not None else "—"
-        market_price_str = f"{item['market_price']:.2f}" if item["market_price"] is not None else "—"
+        status = f"🟢 {item['note']}"
+        offer_price_str = (
+            f"{item['offer_price']:.2f}" if item["offer_price"] is not None else "—"
+        )
+        market_price_str = (
+            f"{item['market_price']:.2f}" if item["market_price"] is not None else "—"
+        )
+
         text = (
-            f"💰 {item['name']}({item['code']})　{item['market']}\n"
+            f"💰 {item['name']}({item['code']}) {item['market']}\n"
             f"{status}\n"
             f"申購期間：{item['period']}\n"
             f"抽籤日：{item['draw_date']}\n"
-            f"承銷價：{offer_price_str}　市價：{market_price_str}\n"
+            f"承銷價：{offer_price_str} 市價：{market_price_str}\n"
             f"預估報酬率：{item['return_pct']:.1f}%\n"
             f"詳情：https://histock.tw/stock/{item['code']}"
         )
+
         push_line_message(text)
         notified.add(key)
-        print(f"已推播：{item['code']} {item['name']}")
 
-    state["notified"] = list(notified)
-    save_state(state)
+        # 每推播成功一檔就立刻存檔：後面某一檔失敗時，前面已通知的不會被重複推播
+        state["notified"] = sorted(notified)
+        save_state(state)
+        print(f"已推播：{item['code']} {item['name']}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        traceback.print_exc()
+        notify_failure(e)
+        sys.exit(1)  # 讓 GitHub Actions 顯示紅叉

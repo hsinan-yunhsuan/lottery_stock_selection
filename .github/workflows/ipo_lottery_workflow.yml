@@ -1,9 +1,10 @@
 # 存放路徑：.github/workflows/ipo_lottery_workflow.yml
 #
 # 用途：平日一天跑 3 次，抓 HiStock 申購日程表，報酬率超過 20% 就推播
-# 跟股價提醒那組 workflow 共用同一個 LINE Bot，Secrets 直接沿用：
+# 改用 Broadcast API，會送給所有加這個 LINE Bot 為好友的人，
+# 不用再維護 user ID 清單。跟股價提醒那組 workflow 共用同一個 LINE Bot，
+# Secrets 直接沿用：
 #   LINE_CHANNEL_ACCESS_TOKEN
-#   LINE_USER_ID
 
 name: IPO Lottery Alert
 
@@ -35,7 +36,6 @@ jobs:
       - name: Run IPO alert script
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
         run: python ipo_lottery_alert.py
 
       # always()：就算上一步失敗也要存檔，

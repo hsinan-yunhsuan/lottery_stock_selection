@@ -5,13 +5,19 @@ LINE Bot：公開申購／股票抽籤提醒
 1. 抓 HiStock 的「公開申購/股票抽籤日程表」網頁（連線失敗會自動重試）
 2. 網頁裡的表格本身就有「報酬率(%)」欄位（承銷價 vs 市價的價差），不用自己再抓即時股價算
 3. 篩選出「還沒截止申購」且「報酬率 >= THRESHOLD_PCT」的股票
-4. 透過 LINE Messaging API 推播；同一檔股票（用代碼+抽籤日當 key）只會提醒一次
+4. 透過 LINE Messaging API 用 Broadcast 推播給所有加這個 Bot 好友的人；
+   同一檔股票（用代碼+抽籤日當 key）只會提醒一次
 5. 如果整支程式執行失敗，會推播一則失敗通知（同一天最多一則），並以錯誤碼 1 結束，
    讓 GitHub Actions 顯示紅叉
 
 需要的環境變數：
     LINE_CHANNEL_ACCESS_TOKEN
-    LINE_USER_ID
+
+注意：
+    Broadcast 會送給「所有」目前加這個 LINE Bot 為好友、且沒有封鎖的人，
+    無法指定名單。LINE 免費方案每月訊息額度是「發送次數 × 好友數」計算，
+    好友數變多、或這支程式跑的頻率變高，都會更快用完額度，超過後當月
+    無法再送出，要留意 LINE Official Account Manager 後台的用量。
 
 安裝套件：
     pip install requests pandas lxml
@@ -34,7 +40,7 @@ import requests
 THRESHOLD_PCT = 20  # 報酬率超過這個百分比才提醒
 STATE_FILE = "ipo_alert_state.json"  # 記錄已提醒過的股票，以及最近一次失敗通知的日期
 LINE_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-LINE_TO = os.environ["LINE_USER_ID"]
+
 SOURCE_URL = "https://histock.tw/stock/public.aspx"
 
 MAX_RETRIES = 4  # 抓網頁最多嘗試幾次
@@ -169,18 +175,19 @@ def save_state(state):
 
 
 # ------------------------
-# LINE 推播
+# LINE 推播（全用戶）
 # ------------------------
 def push_line_message(text):
-    url = "https://api.line.me/v2/bot/message/push"
+    """用 Broadcast API 推播給所有加這個 Bot 為好友的人。"""
+    url = "https://api.line.me/v2/bot/message/broadcast"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_TOKEN}",
     }
-    body = {"to": LINE_TO, "messages": [{"type": "text", "text": text}]}
+    body = {"messages": [{"type": "text", "text": text}]}
     resp = requests.post(url, headers=headers, json=body, timeout=10)
     if not resp.ok:
-        # 印出 LINE 回傳的錯誤內容，方便判斷是 token、user ID 還是額度問題
+        # 印出 LINE 回傳的錯誤內容，方便判斷是 token 還是額度問題
         print(f"LINE API 回應 {resp.status_code}：{resp.text}")
     resp.raise_for_status()
 
